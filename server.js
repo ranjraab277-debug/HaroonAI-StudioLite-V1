@@ -1,93 +1,21 @@
-import http from "http";
-import fs from "fs";
-import path from "path";
-import crypto from "crypto";
-import { URL } from "url";
-
-const PORT = Number(process.env.PORT || 10000);
-const HOST = "0.0.0.0";
-const BRIDGE_TOKEN = process.env.BRIDGE_CONNECT_PASSWORD || "";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
-const PUBLIC_DIR = process.cwd();
-const queue = [];
-const results = new Map();
-const chats = new Map();
-
-function send(res, code, data, type="application/json; charset=utf-8") {
-  const body = typeof data === "string" ? data : JSON.stringify(data);
-  res.writeHead(code, {
-    "Content-Type": type,
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type, X-Bridge-Token",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
-  });
-  res.end(body);
+import http from "node:http";
+const PORT=Number(process.env.PORT||10000),HOST="0.0.0.0";
+const PASS=process.env.BRIDGE_CONNECT_PASSWORD||"",KEY=process.env.GEMINI_API_KEY||"",MODEL=process.env.GEMINI_MODEL||"gemini-3.6-flash";
+const queue=[],results=new Map(),chats=new Map();
+const wait=ms=>new Promise(r=>setTimeout(r,ms));
+const id=()=>Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,9);
+function out(res,c,d){res.writeHead(c,{"Content-Type":"application/json; charset=utf-8","Access-Control-Allow-Origin":"*","Access-Control-Allow-Headers":"Content-Type, X-Bridge-Token","Access-Control-Allow-Methods":"GET,POST,OPTIONS"});res.end(JSON.stringify(d))}
+function body(req){return new Promise((ok,no)=>{let s="";req.on("data",x=>s+=x);req.on("end",()=>{try{ok(s?JSON.parse(s):{})}catch(e){no(e)}})})}
+function auth(req){return PASS&&req.headers["x-bridge-token"]===PASS}
+const allowed=new Set(["CREATE_PART","CREATE_FOLDER","CREATE_MODEL","CREATE_SCRIPT","DELETE","MOVE","RESIZE","ROTATE","RENAME","SET_PROPERTY"]);
+function clean(a){return Array.isArray(a)?a.filter(x=>x&&allowed.has(x.op)).slice(0,100):[]}
+async function ai(message,history){
+ if(!KEY)return {reply:"ضع GEMINI_API_KEY في Render أولاً.",operations:[]};
+ const prompt=`You are Haroon AI V2 for Roblox Studio Lite. Return ONLY JSON {"reply":"Arabic","operations":[...]}. Allowed: CREATE_PART{name,parent,properties}, CREATE_FOLDER{name,parent}, CREATE_MODEL{name,parent}, CREATE_SCRIPT{name,parent,scriptType,source}, DELETE{target}, MOVE{target,position:[x,y,z]}, RESIZE{target,size:[x,y,z]}, ROTATE{target,rotation:[x,y,z]}, RENAME{target,name}, SET_PROPERTY{target,property,value}. Make deterministic small steps. User: ${message}. History: ${history}`;
+ const url=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent?key=${encodeURIComponent(KEY)}`;
+ for(let n=0;n<5;n++){try{const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({contents:[{role:"user",parts:[{text:prompt}]}],generationConfig:{temperature:.15,responseMimeType:"application/json"}})});const t=await r.text();if(r.ok){const j=JSON.parse(t),raw=j?.candidates?.[0]?.content?.parts?.map(x=>x.text||"").join("")||"";try{const p=JSON.parse(raw);p.operations=clean(p.operations);return p}catch{return {reply:raw,operations:[]}}}if(![429,500,502,503,504].includes(r.status))return {reply:`AI provider HTTP ${r.status}`,operations:[]}}catch{}await wait(600*2**n)}
+ return {reply:"تعذر الوصول إلى مزود الذكاء الاصطناعي بعد عدة محاولات. جرّب بعد قليل.",operations:[]};
 }
-function bridgeAuth(req){ return !!BRIDGE_TOKEN && req.headers["x-bridge-token"] === BRIDGE_TOKEN; }
-async function readBody(req){ let s=""; for await(const c of req)s+=c; return s?JSON.parse(s):{}; }
-
-function fallback(text){
-  const ops=[];
-  if(/(منصة|platform|part|بلوك|قطعة)/i.test(text)){
-    const m=text.match(/(\d+(?:\.\d+)?)\s*(?:x|×|في)\s*(\d+(?:\.\d+)?)/i);
-    ops.push({type:"CREATE_PART",name:"HaroonPart",parent:"Workspace",properties:{
-      Size:[Number(m?.[1]||20),2,Number(m?.[2]||20)],Position:[0,1,0],Anchored:true,Material:"SmoothPlastic"
-    }});
-  }
-  if(/(مجلد|folder)/i.test(text))ops.push({type:"CREATE_FOLDER",name:"HaroonFolder",parent:"Workspace"});
-  if(/(احذف|حذف|delete)/i.test(text))ops.push({type:"DELETE",name:"HaroonPart"});
-  return {reply:ops.length?"تم تجهيز أوامر التنفيذ وإرسالها للماب.":"لم أجد عملية بناء واضحة. جرّب: اصنع منصة 20 في 20",operations:ops};
-}
-async function plan(text,history){
-  if(!GEMINI_API_KEY)return fallback(text);
-  const prompt=`Convert this Roblox Studio Lite build request into safe JSON only.
-Schema: {"reply":"Arabic response","operations":[{"type":"CREATE_PART|CREATE_FOLDER|DELETE|MOVE|RESIZE|SET_PROPERTY|RENAME","name":"...","parent":"Workspace","properties":{}}]}
-For CREATE_PART Size and Position are [x,y,z]. Never output arbitrary code.
-Request: ${text}
-History: ${JSON.stringify(history?.slice(-10)||[])}`;
-  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`,{
-    method:"POST",headers:{"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY},
-    body:JSON.stringify({contents:[{role:"user",parts:[{text:prompt}]}],generationConfig:{responseMimeType:"application/json",temperature:0.15}})
-  });
-  if(!r.ok)throw Error("AI provider HTTP "+r.status);
-  const d=await r.json(), raw=d?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if(!raw)throw Error("AI returned no plan");
-  return JSON.parse(raw);
-}
-function serve(res,urlPath){
-  const file=urlPath==="/"?"index.html":urlPath.replace(/^\/+/,"");
-  const target=path.resolve(PUBLIC_DIR,file);
-  if(!target.startsWith(PUBLIC_DIR))return send(res,403,{error:"Forbidden"});
-  if(!fs.existsSync(target)||fs.statSync(target).isDirectory())return send(res,404,{error:"Not found"});
-  const ext=path.extname(target), types={".html":"text/html; charset=utf-8",".js":"text/javascript; charset=utf-8",".css":"text/css; charset=utf-8"};
-  res.writeHead(200,{"Content-Type":types[ext]||"application/octet-stream"});fs.createReadStream(target).pipe(res);
-}
-const server=http.createServer(async(req,res)=>{
-  try{
-    if(req.method==="OPTIONS")return send(res,204,"");
-    const u=new URL(req.url,`http://${req.headers.host}`);
-    if(u.pathname==="/health")return send(res,200,{ok:true,service:"Haroon AI Bridge V1",queue:queue.length,bridgeConfigured:!!BRIDGE_TOKEN});
-    if(u.pathname==="/api/poll"){
-      if(!bridgeAuth(req))return send(res,401,{error:"Invalid Bridge Connect password"});
-      return send(res,200,{ok:true,command:queue.shift()||null});
-    }
-    if(u.pathname==="/api/result"&&req.method==="POST"){
-      if(!bridgeAuth(req))return send(res,401,{error:"Invalid Bridge Connect password"});
-      const b=await readBody(req);results.set(b.id,{...b,receivedAt:Date.now()});return send(res,200,{ok:true});
-    }
-    if(u.pathname==="/api/result"&&req.method==="GET"){
-      return send(res,200,{ok:true,result:results.get(u.searchParams.get("id"))||null});
-    }
-    if(u.pathname==="/api/chat"&&req.method==="POST"){
-      const b=await readBody(req);if(!b.text?.trim())return send(res,400,{error:"Empty message"});
-      const id=b.chatId||crypto.randomUUID(), h=chats.get(id)||[], p=await plan(b.text.trim(),h);
-      h.push({role:"user",text:b.text.trim()},{role:"assistant",text:p.reply,operations:p.operations||[]});chats.set(id,h);
-      let commandId=null;
-      if(p.operations?.length){commandId=crypto.randomUUID();queue.push({id:commandId,chatId:id,createdAt:Date.now(),operations:p.operations});}
-      return send(res,200,{ok:true,chatId:id,commandId,reply:p.reply,operations:p.operations||[],queued:!!commandId});
-    }
-    serve(res,u.pathname);
-  }catch(e){send(res,500,{error:e.message||"Server error"});}
-});
-server.listen(PORT,HOST,()=>console.log(`Haroon AI V1 listening on ${HOST}:${PORT}`));
+const HTML=`<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Haroon AI V2</title><style>body{margin:0;background:#0b0d12;color:#fff;font-family:Arial;height:100vh}.app{display:flex;height:100%}.side{width:260px;background:#11151d;padding:14px}.main{flex:1;display:flex;flex-direction:column}.top{height:56px;border-bottom:1px solid #29303b;padding:0 12px;display:flex;align-items:center;gap:8px}.msgs{flex:1;overflow:auto;max-width:900px;width:100%;margin:auto;padding:18px}.m{padding:12px 15px;margin:9px 0;border-radius:12px;white-space:pre-wrap;background:#171d27}.u{background:#222a38}.composer{display:flex;gap:8px;max-width:900px;width:100%;margin:auto;padding:12px}textarea{flex:1;background:#141922;color:#fff;border:1px solid #303746;border-radius:12px;padding:12px}button{background:#1c2430;color:#fff;border:1px solid #303746;border-radius:9px;padding:10px;cursor:pointer}.close{display:block}@media(max-width:700px){.side{position:fixed;right:0;top:0;bottom:0;z-index:2}.side.hide{display:none}}</style><div class="app"><aside id="side" class="side"><b>Haroon AI V2</b><p><button id="close" class="close">✕ إغلاق واجهة المحادثات</button></p><button id="new">＋ محادثة جديدة</button></aside><main class="main"><div class="top"><button id="open">☰ المحادثات</button><b>Haroon AI Studio Lite V2</b><span id="s">جاهز</span></div><div id="msgs" class="msgs"></div><form id="f" class="composer"><textarea id="i" placeholder="مثلاً: اصنع منصة كبيرة في منتصف الماب"></textarea><button>إرسال</button></form></main></div><script>let cid=localStorage.hcid||crypto.randomUUID(),db=JSON.parse(localStorage.hdb||"{}");db[cid]??=[];const q=x=>document.querySelector(x),msgs=q("#msgs"),s=q("#s");function save(){localStorage.hcid=cid;localStorage.hdb=JSON.stringify(db)}function render(){msgs.innerHTML="";db[cid].forEach(m=>{let d=document.createElement("div");d.className="m "+(m.r=="u"?"u":"");d.textContent=m.t;msgs.append(d)});msgs.scrollTop=msgs.scrollHeight;save()}render();q("#close").onclick=()=>q("#side").classList.add("hide");q("#open").onclick=()=>q("#side").classList.remove("hide");q("#new").onclick=()=>{cid=crypto.randomUUID();db[cid]=[];render()};q("#f").onsubmit=async e=>{e.preventDefault();let t=q("#i").value.trim();if(!t)return;db[cid].push({r:"u",t});q("#i").value="";render();s.textContent="🧠 يفكر...";try{let r=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chatId:cid,message:t})}),d=await r.json();if(!r.ok)throw Error(d.error||"request failed");db[cid].push({r:"a",t:d.reply+(d.operationsCount?`\\n\\n⚙️ عمليات: ${d.operationsCount}\\n📡 ${d.status}`:"")});s.textContent=d.operationsCount?"🔵 أرسل العمليات":"🟢 جاهز";render()}catch(e){db[cid].push({r:"a",t:"❌ "+e.message});s.textContent="🔴 خطأ";render()}};</script>`;
+function handler(req,res){if(req.method==="OPTIONS")return out(res,204,{});const u=new URL(req.url,`http://${req.headers.host||"x"}`);if(u.pathname==="/health")return out(res,200,{ok:true,version:"2.0.0",model:MODEL});if(u.pathname==="/api/poll"){if(!auth(req))return out(res,401,{error:"Invalid bridge token"});return out(res,200,queue.shift()||null)}if(u.pathname==="/api/result"&&req.method==="POST"){if(!auth(req))return out(res,401,{error:"Invalid bridge token"});return body(req).then(b=>{results.set(b.commandId,b);out(res,200,{ok:true})})}if(u.pathname==="/api/result"&&req.method==="GET")return out(res,200,results.get(u.searchParams.get("commandId"))||{status:"waiting"});if(u.pathname==="/api/chat"&&req.method==="POST")return body(req).then(async b=>{let r=await ai(String(b.message||""),""),cid=String(b.chatId||id()),ops=clean(r.operations),commandId=id();if(ops.length)queue.push({commandId,chatId:cid,createdAt:Date.now(),operations:ops});return out(res,200,{ok:true,chatId:cid,commandId,reply:r.reply||"تم.",operationsCount:ops.length,status:ops.length?"queued":"completed"})});if(u.pathname==="/")return(res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"}),res.end(HTML));out(res,404,{error:"Not found"})}
+http.createServer((req,res)=>handler(req,res).catch(e=>out(res,500,{error:e.message}))).listen(PORT,HOST);

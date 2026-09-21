@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: haroon-ai-studio-lite
+    name: haroon-ai-studio-lite-v2
     runtime: node
     buildCommand: npm install
     startCommand: npm start

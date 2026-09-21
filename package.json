@@ -1,1 +1,1 @@
-{"name":"haroon-ai-studio-lite-v1","version":"1.1.0","type":"module","scripts":{"start":"node server.js"},"engines":{"node":">=20 <25"}}
+{"name":"haroon-ai-studio-lite-v2","version":"2.0.0","type":"module","scripts":{"start":"node server.js"},"engines":{"node":">=20 <25"}}

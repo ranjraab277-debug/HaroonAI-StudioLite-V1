@@ -1,94 +1,152 @@
--- HAROON AI STUDIO LITE V1
--- المطلوب منك هنا فقط: ضع رابط Render وكلمة Bridge Connect Password.
--- لا تضع GEMINI API KEY هنا.
+-- Haroon AI Studio Lite V2
+-- سكربت سيرفر واحد مدمج.
+-- غيّر RENDER_URL و BRIDGE_CONNECT_PASSWORD فقط.
+
 local HttpService = game:GetService("HttpService")
-local Workspace = game:GetService("Workspace")
 
-local RENDER_URL = "https://YOUR-SERVICE.onrender.com"
-local BRIDGE_CONNECT_PASSWORD = "ضع_كلمة_الـBridge_هنا"
+local RENDER_URL = "https://YOUR-APP.onrender.com"
+local BRIDGE_CONNECT_PASSWORD = "YOUR_BRIDGE_PASSWORD"
+
 local POLL_SECONDS = 1
+local MAX_RETRIES = 4
 
-local function call(method, url, data)
-    local headers = {
-        ["X-Bridge-Token"] = BRIDGE_CONNECT_PASSWORD,
-        ["Content-Type"] = "application/json"
-    }
-    local ok, res = pcall(function()
-        return HttpService:RequestAsync({
-            Url = url,
-            Method = method,
-            Headers = headers,
-            Body = data and HttpService:JSONEncode(data) or nil
-        })
-    end)
-    if not ok then return false, tostring(res) end
-    if not res.Success then return false, "HTTP "..tostring(res.StatusCode) end
-    local decoded = nil
-    if res.Body and res.Body ~= "" then
-        pcall(function() decoded = HttpService:JSONDecode(res.Body) end)
-    end
-    return true, decoded
+local function request(method, url, body)
+	local headers = {
+		["X-Bridge-Token"] = BRIDGE_CONNECT_PASSWORD,
+		["Content-Type"] = "application/json"
+	}
+	for attempt = 1, MAX_RETRIES do
+		local ok, response = pcall(function()
+			return HttpService:RequestAsync({
+				Url = url, Method = method, Headers = headers, Body = body or ""
+			})
+		end)
+		if ok and response and response.Success then return true, response end
+		task.wait(math.min(2 ^ attempt, 8))
+	end
+	return false, nil
 end
 
-local function parentOf(name)
-    if not name or name == "Workspace" then return Workspace end
-    return Workspace:FindFirstChild(name) or Workspace
+local function findPath(path)
+	if not path or path == "" or path == "Workspace" then return workspace end
+	local current = game
+	for part in string.gmatch(path, "[^%.]+") do
+		current = current:FindFirstChild(part)
+		if not current then return nil end
+	end
+	return current
 end
 
-local function find(name)
-    return Workspace:FindFirstChild(name, true)
+local function vec3(v)
+	if typeof(v) == "table" and #v >= 3 then
+		return Vector3.new(tonumber(v[1]) or 0, tonumber(v[2]) or 0, tonumber(v[3]) or 0)
+	end
 end
 
-local function prop(obj,key,v)
-    if (key=="Size" or key=="Position") and typeof(v)=="table" then
-        v=Vector3.new(v[1],v[2],v[3])
-    elseif key=="Color" and typeof(v)=="table" then
-        v=Color3.fromRGB(v[1],v[2],v[3])
-    elseif key=="Material" and typeof(v)=="string" then
-        local ok,m=pcall(function() return Enum.Material[v] end)
-        if ok and m then v=m end
-    end
-    return pcall(function() obj[key]=v end)
+local function setProperty(obj, prop, value)
+	if prop == "Size" or prop == "Position" or prop == "Orientation" then
+		value = vec3(value)
+	elseif prop == "Color" and typeof(value) == "table" then
+		value = Color3.new(tonumber(value[1]) or 1, tonumber(value[2]) or 1, tonumber(value[3]) or 1)
+	elseif prop == "Material" and typeof(value) == "string" and Enum.Material[value] then
+		value = Enum.Material[value]
+	end
+	return pcall(function() obj[prop] = value end)
+end
+
+local function create(className, name, parent)
+	local ok, obj = pcall(function()
+		local x = Instance.new(className)
+		x.Name = name or className
+		x.Parent = parent
+		return x
+	end)
+	return ok and obj or nil
 end
 
 local function execute(op)
-    if op.type=="CREATE_PART" then
-        local p=Instance.new("Part")
-        p.Name=op.name or "HaroonPart";p.Anchored=true;p.Parent=parentOf(op.parent)
-        for k,v in pairs(op.properties or {}) do prop(p,k,v) end
-        return true,p:GetFullName()
-    elseif op.type=="CREATE_FOLDER" then
-        local f=Instance.new("Folder");f.Name=op.name or "HaroonFolder";f.Parent=parentOf(op.parent)
-        return true,f:GetFullName()
-    elseif op.type=="DELETE" then
-        local o=find(op.name);if not o then return false,"Not found: "..tostring(op.name) end;o:Destroy();return true,"Deleted"
-    elseif op.type=="MOVE" then
-        local o=find(op.name);if not o or not o:IsA("BasePart") then return false,"Part not found" end
-        o.Position=Vector3.new(op.position[1],op.position[2],op.position[3]);return true,"Moved"
-    elseif op.type=="RESIZE" then
-        local o=find(op.name);if not o or not o:IsA("BasePart") then return false,"Part not found" end
-        o.Size=Vector3.new(op.size[1],op.size[2],op.size[3]);return true,"Resized"
-    elseif op.type=="RENAME" then
-        local o=find(op.name);if not o then return false,"Not found" end;o.Name=tostring(op.newName);return true,"Renamed"
-    elseif op.type=="SET_PROPERTY" then
-        local o=find(op.name);if not o then return false,"Not found" end
-        for k,v in pairs(op.properties or {}) do if not prop(o,k,v) then return false,"Property failed: "..k end end
-        return true,"Updated"
-    end
-    return false,"Unknown operation: "..tostring(op.type)
+	local kind = op.op
+
+	if kind == "CREATE_PART" then
+		local parent = findPath(op.parent)
+		if not parent then return false, "Parent not found" end
+		local obj = create("Part", op.name, parent)
+		if not obj then return false, "Create Part failed" end
+		for p,v in pairs(op.properties or {}) do setProperty(obj,p,v) end
+		return true, obj:GetFullName()
+
+	elseif kind == "CREATE_FOLDER" or kind == "CREATE_MODEL" then
+		local parent = findPath(op.parent)
+		if not parent then return false, "Parent not found" end
+		local obj = create(kind == "CREATE_FOLDER" and "Folder" or "Model", op.name, parent)
+		return obj ~= nil, obj and obj:GetFullName() or "Create failed"
+
+	elseif kind == "CREATE_SCRIPT" then
+		local parent = findPath(op.parent)
+		if not parent then return false, "Parent not found" end
+		local className = op.scriptType == "LocalScript" and "LocalScript"
+			or op.scriptType == "ModuleScript" and "ModuleScript" or "Script"
+		local obj = create(className, op.name, parent)
+		if not obj then return false, "Create script failed" end
+		local ok = pcall(function() obj.Source = tostring(op.source or "") end)
+		if not ok then obj:Destroy(); return false, "Script.Source is not available in this environment" end
+		return true, obj:GetFullName()
+
+	elseif kind == "DELETE" then
+		local obj = findPath(op.target)
+		if not obj or obj == game then return false, "Target not found" end
+		obj:Destroy(); return true, "deleted"
+
+	elseif kind == "MOVE" or kind == "RESIZE" then
+		local obj = findPath(op.target)
+		local value = vec3(kind == "MOVE" and op.position or op.size)
+		if not obj or not value then return false, "Invalid target/value" end
+		return setProperty(obj, kind == "MOVE" and "Position" or "Size", value), kind == "MOVE" and "moved" or "resized"
+
+	elseif kind == "ROTATE" then
+		local obj = findPath(op.target)
+		local value = vec3(op.rotation)
+		if not obj or not value then return false, "Invalid target/value" end
+		return setProperty(obj, "Orientation", value), "rotated"
+
+	elseif kind == "RENAME" then
+		local obj = findPath(op.target)
+		if not obj then return false, "Target not found" end
+		obj.Name = tostring(op.name or obj.Name); return true, "renamed"
+
+	elseif kind == "SET_PROPERTY" then
+		local obj = findPath(op.target)
+		if not obj then return false, "Target not found" end
+		return setProperty(obj, op.property, op.value), "property set"
+	end
+
+	return false, "Unsupported operation: "..tostring(kind)
 end
 
-print("[Haroon AI] Starting connection...")
-while true do
-    local ok,data=call("GET",RENDER_URL.."/api/poll")
-    if ok and data and data.command then
-        local c=data.command;local out={}
-        for _,op in ipairs(c.operations or {}) do
-            local success,msg=execute(op)
-            table.insert(out,{success=success,message=msg,type=op.type})
-            if not success then break end
-        end
-        call("POST",RENDER_URL.."/api/result",{id=c.id,success=true,operations=out,finishedAt=os.time()})
-    end
-    task.wait(POLL_SECONDS)
+local function sendResult(commandId, results)
+	local body = HttpService:JSONEncode({
+		commandId = commandId, status = "completed", results = results
+	})
+	request("POST", RENDER_URL.."/api/result", body)
 end
+
+print("[Haroon AI V2] Bridge starting")
+
+task.spawn(function()
+	while true do
+		local ok, response = request("GET", RENDER_URL.."/api/poll")
+		if ok and response then
+			local decoded, job = pcall(function() return HttpService:JSONDecode(response.Body) end)
+			if decoded and job and job.commandId and job.operations then
+				local results = {}
+				for i,op in ipairs(job.operations) do
+					local success, message = execute(op)
+					results[i] = {op=op.op, success=success, message=message}
+					task.wait(0.05)
+				end
+				sendResult(job.commandId, results)
+			end
+		end
+		task.wait(POLL_SECONDS)
+	end
+end)
