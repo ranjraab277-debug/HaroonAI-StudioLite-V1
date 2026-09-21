@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: haroon-ai-studio-lite
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: BRIDGE_CONNECT_PASSWORD
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.6-flash
